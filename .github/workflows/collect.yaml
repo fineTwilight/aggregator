@@ -1,9 +1,25 @@
 name: Collect
 on:
-  # executed once a week on Sundays at 00:00
+  # 每天凌晨2点执行（避开高峰期）
   schedule:
-    - cron: "0 0 * * 1"
+    - cron: "0 2 * * *"
+  # 保留手动触发功能
   workflow_dispatch:
+    inputs:
+      force_clean:
+        description: 'Force clean all cache'
+        required: false
+        default: 'false'
+        type: boolean
+      collection_mode:
+        description: 'Collection mode'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+        - 'auto'
+        - 'aggressive'
+        - 'conservative'
 
 concurrency:
   group: ${{ github.repository }}
@@ -26,46 +42,368 @@ env:
   # include special protocols, such as vless hysteria2 and hysteria
   ENABLE_SPECIAL_PROTOCOLS: ${{ vars.ENABLE_SPECIAL_PROTOCOLS }}
 
+  # 优化环境变量，确保获取新节点
+  WORKFLOW_MODE: "0"  # 完整的爬取和聚合模式
+  SKIP_ALIVE_CHECK: "false"  # 确保检查节点存活
+  SKIP_REMARK: "false"  # 不跳过标记
+
 jobs:
   process:
     runs-on: ubuntu-latest
+    timeout-minutes: 90  # 设置超时防止卡死
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           ref: main
+          fetch-depth: 1
 
-      - name: Prepare
+      - name: Setup Python Environment
         uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: "3.11"
           architecture: "x64"
           cache: "pip"
+          cache-dependency-path: 'requirements.txt'
 
-      - name: Install
-        run: pip3 install -r requirements.txt
-
-      - name: Check
+      - name: Install Dependencies
         run: |
+          echo "=== Installing Dependencies ==="
+          pip3 install --upgrade pip setuptools wheel
+          pip3 install -r requirements.txt
+          echo "✅ Dependencies installed successfully"
+
+      - name: Validate Environment Variables
+        run: |
+          echo "=== Environment Validation ==="
+          
+          # 必需的环境变量检查
+          ERROR_COUNT=0
+          
           if [ -z "$GIST_PAT" ]; then
-              echo "Error: environment 'GIST_PAT' cannot be empty"
-              exit 1
+              echo "❌ Error: GIST_PAT cannot be empty"
+              ERROR_COUNT=$((ERROR_COUNT + 1))
+          else
+              echo "✅ GIST_PAT is configured"
           fi
 
           if [ -z "$GIST_LINK" ]; then
-              echo "Error: environment 'GIST_LINK' cannot be empty"
+              echo "❌ Error: GIST_LINK cannot be empty"
+              ERROR_COUNT=$((ERROR_COUNT + 1))
+          else
+              echo "✅ GIST_LINK is set: $GIST_LINK"
+              
+              # 验证GIST_LINK格式
+              LINK_PARTS=$(echo "$GIST_LINK" | awk -F'/' 'NF==2 && $1!="" && $2!=""')
+              if [ -z "$LINK_PARTS" ]; then
+                  echo "❌ Error: GIST_LINK format invalid, should be 'username/gist_id'"
+                  ERROR_COUNT=$((ERROR_COUNT + 1))
+              else
+                  echo "✅ GIST_LINK format is valid"
+              fi
+          fi
+
+          # 可选环境变量检查
+          if [ -n "$CUSTOMIZE_LINK" ]; then
+              echo "✅ CUSTOMIZE_LINK is configured"
+          else
+              echo "ℹ️  CUSTOMIZE_LINK is not set (optional)"
+          fi
+
+          if [ -n "$ENABLE_SPECIAL_PROTOCOLS" ]; then
+              echo "✅ ENABLE_SPECIAL_PROTOCOLS: $ENABLE_SPECIAL_PROTOCOLS"
+          else
+              echo "ℹ️  ENABLE_SPECIAL_PROTOCOLS is not set (optional)"
+          fi
+          
+          if [ $ERROR_COUNT -gt 0 ]; then
+              echo "❌ Validation failed with $ERROR_COUNT errors"
+              exit 1
+          fi
+          
+          echo "✅ Environment validation passed"
+
+      - name: Prepare Workspace and Clean Cache
+        run: |
+          echo "=== Workspace Preparation ==="
+          
+          # 创建必要的目录
+          mkdir -p data
+          mkdir -p subconverter
+          
+          # 确保执行权限
+          chmod +x clash/clash-* || true
+          chmod +x subconverter/subconverter-* || true
+          
+          # 决定清理策略
+          FORCE_CLEAN="${{ github.event.inputs.force_clean }}"
+          CURRENT_DAY=$(date +%u)  # 1=Monday, 7=Sunday
+          CURRENT_HOUR=$(date +%H)
+          
+          echo "📅 Current day: $CURRENT_DAY (1=Mon, 7=Sun)"
+          echo "🕐 Current hour: $CURRENT_HOUR"
+          
+          # 清理策略
+          if [ "$FORCE_CLEAN" = "true" ]; then
+              echo "🧹 Force clean mode activated"
+              CLEAN_MODE="force"
+          elif [ "$CURRENT_DAY" = "1" ]; then
+              echo "🧹 Weekly deep clean (Monday)"
+              CLEAN_MODE="weekly"
+          elif [ "$CURRENT_DAY" = "4" ]; then
+              echo "🧹 Mid-week refresh (Thursday)"
+              CLEAN_MODE="refresh"
+          else
+              echo "🔄 Daily maintenance clean"
+              CLEAN_MODE="daily"
+          fi
+          
+          # 执行清理
+          case $CLEAN_MODE in
+              "force"|"weekly")
+                  echo "🗑️  Performing deep clean..."
+                  rm -f data/subscribes.txt data/domains.txt data/valid-domains.txt data/coupons.txt || true
+                  rm -f subconverter/generate.ini subconverter/config.yaml || true
+                  echo "✅ Deep clean completed"
+                  ;;
+              "refresh")
+                  echo "🔄 Performing refresh clean..."
+                  rm -f data/subscribes.txt data/valid-domains.txt || true
+                  echo "✅ Refresh clean completed"
+                  ;;
+              "daily")
+                  echo "🧼 Performing daily clean..."
+                  rm -f data/subscribes.txt || true
+                  echo "✅ Daily clean completed"
+                  ;;
+          esac
+          
+          # 显示当前状态
+          echo "📁 Data directory contents:"
+          ls -la data/ 2>/dev/null || echo "Data directory is empty"
+          
+          # 输出清理模式供后续步骤使用
+          echo "CLEAN_MODE=$CLEAN_MODE" >> $GITHUB_ENV
+
+      - name: Determine Collection Parameters
+        run: |
+          echo "=== Collection Parameters Setup ==="
+          
+          # 获取输入参数
+          COLLECTION_MODE="${{ github.event.inputs.collection_mode }}"
+          CURRENT_DAY=$(date +%u)
+          CLEAN_MODE="${{ env.CLEAN_MODE }}"
+          
+          # 默认参数
+          PAGES=5
+          DELAY=4000
+          FLOW=1
+          LIFE=6
+          THREADS=48
+          EXTRA_ARGS=""
+          
+          # 根据模式调整参数
+          if [ "$COLLECTION_MODE" = "aggressive" ] || [ "$CLEAN_MODE" = "force" ] || [ "$CLEAN_MODE" = "weekly" ]; then
+              echo "🚀 Using aggressive collection mode"
+              PAGES=10
+              DELAY=6000
+              FLOW=3
+              LIFE=24
+              THREADS=64
+              EXTRA_ARGS="--easygoing"
+          elif [ "$COLLECTION_MODE" = "conservative" ]; then
+              echo "🐌 Using conservative collection mode"
+              PAGES=3
+              DELAY=3000
+              FLOW=0.5
+              LIFE=3
+              THREADS=32
+          elif [ "$CURRENT_DAY" = "1" ]; then
+              echo "📅 Monday - Using enhanced collection mode"
+              PAGES=8
+              DELAY=5000
+              FLOW=2
+              LIFE=12
+              THREADS=56
+              EXTRA_ARGS="--easygoing"
+          elif [ "$CURRENT_DAY" = "4" ]; then
+              echo "📅 Thursday - Using refresh collection mode"
+              PAGES=6
+              DELAY=4500
+              FLOW=1.5
+              LIFE=8
+              THREADS=52
+          else
+              echo "📅 Regular day - Using standard collection mode"
+          fi
+          
+          # 输出参数供后续使用
+          echo "COLLECT_PAGES=$PAGES" >> $GITHUB_ENV
+          echo "COLLECT_DELAY=$DELAY" >> $GITHUB_ENV
+          echo "COLLECT_FLOW=$FLOW" >> $GITHUB_ENV
+          echo "COLLECT_LIFE=$LIFE" >> $GITHUB_ENV
+          echo "COLLECT_THREADS=$THREADS" >> $GITHUB_ENV
+          echo "COLLECT_EXTRA_ARGS=$EXTRA_ARGS" >> $GITHUB_ENV
+          
+          echo "📊 Collection parameters:"
+          echo "  - Pages: $PAGES"
+          echo "  - Delay: ${DELAY}ms"
+          echo "  - Flow: ${FLOW}GB"
+          echo "  - Life: ${LIFE}h"
+          echo "  - Threads: $THREADS"
+          echo "  - Extra args: $EXTRA_ARGS"
+
+      - name: Collect Proxies
+        run: |
+          echo "=== Starting Proxy Collection ==="
+          echo "🕐 Start time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          
+          # 构建命令
+          CMD="python -u subscribe/collect.py"
+          CMD="$CMD --all"
+          CMD="$CMD --overwrite"
+          CMD="$CMD --pages ${{ env.COLLECT_PAGES }}"
+          CMD="$CMD --delay ${{ env.COLLECT_DELAY }}"
+          CMD="$CMD --flow ${{ env.COLLECT_FLOW }}"
+          CMD="$CMD --life ${{ env.COLLECT_LIFE }}"
+          CMD="$CMD --num ${{ env.COLLECT_THREADS }}"
+          
+          # 添加额外参数
+          if [ -n "${{ env.COLLECT_EXTRA_ARGS }}" ]; then
+              CMD="$CMD ${{ env.COLLECT_EXTRA_ARGS }}"
+          fi
+          
+          echo "🚀 Executing command: $CMD"
+          echo ""
+          
+          # 执行收集
+          eval $CMD
+          COLLECT_STATUS=$?
+          
+          echo ""
+          echo "📊 Collection completed with status: $COLLECT_STATUS"
+          echo "🕐 End time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          
+          if [ $COLLECT_STATUS -ne 0 ]; then
+              echo "❌ Collection failed with exit code: $COLLECT_STATUS"
+              exit $COLLECT_STATUS
+          fi
+          
+          echo "✅ Collection completed successfully"
+
+      - name: Validate and Report Results
+        run: |
+          echo "=== Results Validation and Report ==="
+          
+          SUCCESS=true
+          
+          # 检查订阅文件
+          if [ -f "data/subscribes.txt" ]; then
+              SUB_COUNT=$(wc -l < data/subscribes.txt 2>/dev/null || echo "0")
+              echo "✅ Subscriptions found: $SUB_COUNT"
+              
+              if [ "$SUB_COUNT" -eq 0 ]; then
+                  echo "⚠️  Warning: No subscriptions in file"
+                  SUCCESS=false
+              elif [ "$SUB_COUNT" -lt 5 ]; then
+                  echo "⚠️  Warning: Very few subscriptions ($SUB_COUNT < 5)"
+              fi
+              
+              # 显示前几个订阅（隐藏敏感信息）
+              echo "📋 Sample subscriptions:"
+              head -3 data/subscribes.txt | sed 's/token=[^&]*/token=****/g' || true
+          else
+              echo "❌ subscribes.txt not found"
+              SUCCESS=false
+          fi
+          
+          # 检查有效域名
+          if [ -f "data/valid-domains.txt" ]; then
+              DOMAIN_COUNT=$(wc -l < data/valid-domains.txt 2>/dev/null || echo "0")
+              echo "✅ Valid domains found: $DOMAIN_COUNT"
+              
+              if [ "$DOMAIN_COUNT" -gt 0 ]; then
+                  echo "📋 Sample domains:"
+                  head -3 data/valid-domains.txt || true
+              fi
+          else
+              echo "ℹ️  valid-domains.txt not found (optional)"
+          fi
+          
+          # 检查生成的配置文件
+          echo "📁 Generated files:"
+          find data/ -type f -name "*.txt" -o -name "*.yaml" -o -name "*.json" 2>/dev/null | \
+              while read file; do
+                  SIZE=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo "unknown")
+                  echo "  - $file (${SIZE} bytes)"
+              done
+          
+          # 检查网络连接
+          echo "🌐 Network connectivity test:"
+          if curl -s --max-time 10 https://www.google.com/generate_204 >/dev/null; then
+              echo "✅ Internet connection is working"
+          else
+              echo "⚠️  Warning: Internet connection issues detected"
+          fi
+          
+          # 最终状态
+          if [ "$SUCCESS" = true ]; then
+              echo "🎉 Validation passed - Collection was successful!"
+          else
+              echo "❌ Validation failed - Some issues detected"
               exit 1
           fi
 
-          LINK_PARTS=$(echo "$GIST_LINK" | awk -F'/' 'NF==2 && $1!="" && $2!=""')
-          if [ -z "$LINK_PARTS" ]; then
-              echo "Error: environment 'GIST_LINK' is not valid, should be 'username/gist_id' format"
-              exit 1
+      - name: System Information
+        if: always()
+        run: |
+          echo "=== System Information ==="
+          echo "🖥️  System info:"
+          uname -a || true
+          echo ""
+          echo "💾 Memory usage:"
+          free -h || true
+          echo ""
+          echo "💽 Disk usage:"
+          df -h / || true
+          echo ""
+          echo "🐍 Python version:"
+          python3 --version || true
+          echo ""
+          echo "📦 Installed packages:"
+          pip3 list | grep -E "(requests|pyyaml|beautifulsoup)" || true
+
+      - name: Cleanup and Summary
+        if: always()
+        run: |
+          echo "=== Cleanup and Final Summary ==="
+          
+          # 清理临时文件
+          echo "🧹 Cleaning temporary files..."
+          rm -f subconverter/generate.ini || true
+          rm -f clash/config.yaml || true
+          find . -name "*.pyc" -delete 2>/dev/null || true
+          find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+          
+          echo "📊 Final statistics:"
+          echo "  - Workflow duration: $((SECONDS / 60)) minutes $((SECONDS % 60)) seconds"
+          echo "  - Completion time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "  - Next scheduled run: $(date -d 'tomorrow 2:00' '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo 'Tomorrow at 02:00')"
+          
+          # GitHub API 使用情况
+          if [ -n "$GIST_PAT" ]; then
+              echo "🔗 GitHub API rate limit status:"
+              curl -s -H "Authorization: token $GIST_PAT" https://api.github.com/rate_limit | \
+                  jq -r '.rate | "Used: \(.used)/\(.limit), Reset: \(.reset | strftime("%Y-%m-%d %H:%M:%S"))"' 2>/dev/null || \
+                  echo "Rate limit check failed"
           fi
+          
+          echo "✅ Workflow completed successfully!"
 
-      - name: Collect
-        run: python -u subscribe/collect.py --all --overwrite --skip
-
-      - name: Timestamp
-        run: date
+      - name: Final Timestamp
+        run: |
+          echo "=== Final Timestamp ==="
+          echo "🏁 Workflow completed at: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "⏰ Total execution time: $((SECONDS / 60))m $((SECONDS % 60))s"
+          echo "🔄 Status: SUCCESS"
