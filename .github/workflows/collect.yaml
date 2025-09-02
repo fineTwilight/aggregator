@@ -14,12 +14,13 @@ on:
       collection_mode:
         description: 'Collection mode'
         required: false
-        default: 'auto'
+        default: 'original'
         type: choice
         options:
         - 'auto'
         - 'aggressive'
         - 'conservative'
+        - 'original'
 
 concurrency:
   group: ${{ github.repository }}
@@ -195,47 +196,57 @@ jobs:
           CURRENT_DAY=$(date +%u)
           CLEAN_MODE="${{ env.CLEAN_MODE }}"
           
-          # 默认参数
-          PAGES=5
-          DELAY=4000
-          FLOW=1
-          LIFE=6
-          THREADS=48
-          EXTRA_ARGS=""
+          # 默认参数（更宽松，接近原始效果）
+          PAGES=8
+          DELAY=5000
+          FLOW=0
+          LIFE=0
+          THREADS=64
+          EXTRA_ARGS="--skip"
           
           # 根据模式调整参数
-          if [ "$COLLECTION_MODE" = "aggressive" ] || [ "$CLEAN_MODE" = "force" ] || [ "$CLEAN_MODE" = "weekly" ]; then
-              echo "🚀 Using aggressive collection mode"
-              PAGES=10
-              DELAY=6000
-              FLOW=3
-              LIFE=24
+          if [ "$COLLECTION_MODE" = "original" ]; then
+              echo "🔄 Using original collection mode (maximum compatibility)"
+              PAGES=""  # 不限制页面数
+              DELAY=5000
+              FLOW=0
+              LIFE=0
               THREADS=64
-              EXTRA_ARGS="--easygoing"
+              EXTRA_ARGS="--skip"
+          elif [ "$COLLECTION_MODE" = "aggressive" ] || [ "$CLEAN_MODE" = "force" ] || [ "$CLEAN_MODE" = "weekly" ]; then
+              echo "🚀 Using aggressive collection mode"
+              PAGES=15
+              DELAY=6000
+              FLOW=0
+              LIFE=0
+              THREADS=64
+              EXTRA_ARGS="--skip --easygoing"
           elif [ "$COLLECTION_MODE" = "conservative" ]; then
               echo "🐌 Using conservative collection mode"
-              PAGES=3
-              DELAY=3000
-              FLOW=0.5
-              LIFE=3
-              THREADS=32
+              PAGES=5
+              DELAY=4000
+              FLOW=1
+              LIFE=6
+              THREADS=48
+              EXTRA_ARGS=""
           elif [ "$CURRENT_DAY" = "1" ]; then
               echo "📅 Monday - Using enhanced collection mode"
-              PAGES=8
+              PAGES=12
               DELAY=5000
-              FLOW=2
-              LIFE=12
-              THREADS=56
-              EXTRA_ARGS="--easygoing"
+              FLOW=0
+              LIFE=0
+              THREADS=64
+              EXTRA_ARGS="--skip --easygoing"
           elif [ "$CURRENT_DAY" = "4" ]; then
-              echo "📅 Thursday - Using refresh collection mode"
-              PAGES=6
-              DELAY=4500
-              FLOW=1.5
-              LIFE=8
-              THREADS=52
+              echo "📅 Thursday - Using quality check mode"
+              PAGES=8
+              DELAY=4000
+              FLOW=0.5
+              LIFE=3
+              THREADS=56
+              EXTRA_ARGS=""
           else
-              echo "📅 Regular day - Using standard collection mode"
+              echo "📅 Regular day - Using balanced collection mode"
           fi
           
           # 输出参数供后续使用
@@ -263,10 +274,23 @@ jobs:
           CMD="python -u subscribe/collect.py"
           CMD="$CMD --all"
           CMD="$CMD --overwrite"
-          CMD="$CMD --pages ${{ env.COLLECT_PAGES }}"
+          
+          # 只在有值时添加参数
+          if [ -n "${{ env.COLLECT_PAGES }}" ]; then
+              CMD="$CMD --pages ${{ env.COLLECT_PAGES }}"
+          fi
+          
           CMD="$CMD --delay ${{ env.COLLECT_DELAY }}"
-          CMD="$CMD --flow ${{ env.COLLECT_FLOW }}"
-          CMD="$CMD --life ${{ env.COLLECT_LIFE }}"
+          
+          # 只在大于0时添加流量和时间限制
+          if [ "${{ env.COLLECT_FLOW }}" != "0" ]; then
+              CMD="$CMD --flow ${{ env.COLLECT_FLOW }}"
+          fi
+          
+          if [ "${{ env.COLLECT_LIFE }}" != "0" ]; then
+              CMD="$CMD --life ${{ env.COLLECT_LIFE }}"
+          fi
+          
           CMD="$CMD --num ${{ env.COLLECT_THREADS }}"
           
           # 添加额外参数
